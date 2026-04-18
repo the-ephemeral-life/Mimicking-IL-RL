@@ -314,27 +314,42 @@ def _shoulder_angles(lms, side: str):
     s_idx  = MP.LEFT_SHOULDER  if side == "left" else MP.RIGHT_SHOULDER
     e_idx  = MP.LEFT_ELBOW     if side == "left" else MP.RIGHT_ELBOW
     o_idx  = MP.RIGHT_SHOULDER if side == "left" else MP.LEFT_SHOULDER
-    roll_s = 1.0               if side == "left" else -1.0
 
     shoulder = _p(lms, s_idx)
     elbow    = _p(lms, e_idx)
     opp_sh   = _p(lms, o_idx)
 
+    # --- 1. DEFINE AXES ---
     trunk_right = _unit(opp_sh - shoulder) * (-1 if side == "left" else 1)
+    trunk_left  = -trunk_right  # Explicitly defined to fix the crash!
     world_up    = np.array([0., 0., 1.])
     trunk_fwd   = _unit(np.cross(trunk_right, world_up))
 
     upper_arm = _unit(elbow - shoulder)
 
-    pitch = float(np.arcsin(np.clip( np.dot(upper_arm, trunk_fwd), -1, 1)))
-    roll  = float(np.arcsin(np.clip( np.dot(upper_arm, world_up),  -1, 1))) * roll_s
+    # --- 2. PITCH (Sagittal plane) ---
+    # Negative sign restores the UI "-1 moves forward" polarity
+    v_fwd = np.dot(upper_arm, trunk_fwd)
+    pitch = -float(np.arcsin(np.clip(v_fwd, -1.0, 1.0)))
 
-    ua_h  = _unit(np.array([upper_arm[0], upper_arm[1], 0.]) + 1e-9)
-    ref_h = _unit(np.array([trunk_fwd[0], trunk_fwd[1], 0.]) + 1e-9)
-    yaw   = _signed_angle(ref_h, ua_h, world_up)
+    # --- 3. ROLL (Coronal plane) ---
+    # Using arcsin isolates Roll from Gravity, completely fixing the "Zombie Pose"
+    v_lat = np.dot(upper_arm, trunk_left)
+    roll = float(np.arcsin(np.clip(v_lat, -1.0, 1.0)))
+
+    # --- 4. YAW (Horizontal plane) ---
+    ua_h  = np.array([upper_arm[0], upper_arm[1], 0.])
+    horiz_mag = np.linalg.norm(ua_h)
+    
+    # The 0.30 deadzone prevents violent Yaw swinging when arms are resting
+    if horiz_mag > 0.30:
+        ref_h = _unit(np.array([trunk_fwd[0], trunk_fwd[1], 0.]) + 1e-9)
+        ua_h_unit = ua_h / horiz_mag
+        yaw = _signed_angle(ref_h, ua_h_unit, world_up)
+    else:
+        yaw = 0.0
 
     return pitch, roll, yaw
-
 
 # ── 7f. Elbow ─────────────────────────────────────────────────────────────────
 
