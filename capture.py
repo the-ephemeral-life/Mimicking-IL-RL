@@ -63,9 +63,13 @@ _MED    = 0.52
 _LARGE  = 0.68
 
 
+_FONT   = cv2.FONT_HERSHEY_SIMPLEX
+_SMALL  = 0.38
+_MED    = 0.52
+_LARGE  = 0.68
+
 def _put(img, text, xy, scale=_MED, color=_C["white"], thick=1):
     cv2.putText(img, text, xy, _FONT, scale, color, thick, cv2.LINE_AA)
-
 
 def _draw_live_overlay(img, frame: G1Frame | None, recording: bool, n_frames: int):
     h, w = img.shape[:2]
@@ -85,7 +89,7 @@ def _draw_live_overlay(img, frame: G1Frame | None, recording: bool, n_frames: in
     _put(img, f"Conf: {frame.confidence:.2f}", (w - 170, 23), _MED, conf_c)
 
     # ── Joint angle panel (right edge) ────────────────────────────────────────
-    pw = 210
+    pw = 280
     x0 = w - pw - 4
     cv2.rectangle(img, (x0, 36), (w - 4, 36 + DOF * 16 + 8), _C["panel"], -1)
 
@@ -93,16 +97,16 @@ def _draw_live_overlay(img, frame: G1Frame | None, recording: bool, n_frames: in
         t   = (angle - jspec.lo) / (jspec.hi - jspec.lo + 1e-9)
         col = _C["green"] if 0.05 < t < 0.95 else _C["red"]
         row = 36 + 8 + i * 16
+        
         # mini bar
         bar_w = int(t * 50)
         cv2.rectangle(img, (x0 + 2, row - 10), (x0 + 52, row - 3), (50, 50, 60), -1)
         cv2.rectangle(img, (x0 + 2, row - 10), (x0 + 2 + bar_w, row - 3), col, -1)
-        _put(img, f"{jspec.name[:14]:<14} {angle:+.2f}", (x0 + 56, row - 2), _SMALL, col)
+        _put(img, f"{jspec.name:<22} {angle:+.2f}", (x0 + 56, row - 2), _SMALL, col)
 
     # ── Hint strip ────────────────────────────────────────────────────────────
     cv2.rectangle(img, (0, h - 24), (w, h), _C["dark"], -1)
     _put(img, "SPACE:rec/pause  S:save  C:clear  Q:quit", (8, h - 7), _SMALL, _C["white"])
-
 
 def _draw_batch_overlay(img, frame: G1Frame | None, frame_idx: int, total: int):
     h, w = img.shape[:2]

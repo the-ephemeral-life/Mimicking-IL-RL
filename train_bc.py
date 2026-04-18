@@ -36,7 +36,7 @@ class G1ImitationDataset(Dataset):
         
         # THE MAGIC SLICE: Extract only the 4 Left Arm joints and 4 Right Arm joints
         left_arm_angles = all_angles[:, 15:19]
-        right_arm_angles = all_angles[:, 22:26]
+        right_arm_angles = all_angles[:, 20:24]
         
         # Combine them into an 8-column array
         self.Y = np.concatenate([left_arm_angles, right_arm_angles], axis=1)
@@ -46,7 +46,7 @@ class G1ImitationDataset(Dataset):
     def __len__(self): return len(self.X)
     def __getitem__(self, idx): return self.X[idx], self.Y[idx]
 # --- 3. TRAINING LOOP ---
-def train_model(dataset_path="dataset.npz", epochs=50, batch_size=64, lr=0.001):
+def train_model(dataset_path="dataset.npz", epochs=100, batch_size=64, lr=0.001):
     # Setup Data
     dataset = G1ImitationDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -87,4 +87,4 @@ def train_model(dataset_path="dataset.npz", epochs=50, batch_size=64, lr=0.001):
 
 if __name__ == "__main__":
     # Change "dataset.npz" to whatever your capture script generated
-    train_model(dataset_path="dataset.h5")
+    train_model(dataset_path="gesture.h5")

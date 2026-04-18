@@ -49,6 +49,25 @@ def get_gravity_orientation(q):
 def pd_control(target_q, q, kp, target_dq, dq, kd):
     return (target_q - q) * kp + (target_dq - dq) * kd
 
+def _print_inference_dashboard(step_counter, arm_targets, leg_targets):
+    """Creates a static, updating telemetry dashboard in the terminal."""
+    # ANSI escape codes: \033[2J clears the screen, \033[H moves cursor to top-left
+    print("\033[2J\033[H", end="")
+    
+    print("="*55)
+    print(f"🤖 G1 SIMULATION TELEMETRY  |  Step: {step_counter}")
+    print("="*55)
+    
+    print("─── ARM TARGETS (Imitation Learning) ───")
+    for name, angle in zip(ARM_JOINT_NAMES, arm_targets):
+        print(f"{name:<30} : {angle:>+6.3f} rad")
+        
+    print("\n─── LEG TARGETS (RL Walking Policy) ────")
+    for name, angle in zip(LEG_JOINT_NAMES, leg_targets):
+        print(f"{name:<30} : {angle:>+6.3f} rad")
+        
+    print("="*55)
+
 # ================= INITIALIZATION =================
 if __name__ == "__main__":
     
