@@ -21,7 +21,7 @@ LEG_JOINT_NAMES = [
 
 # ================= HELPER FUNCTIONS =================
 class BehavioralCloningMLP(nn.Module):
-    def __init__(self, input_dim=99, output_dim=29):
+    def __init__(self, input_dim=99, output_dim=8):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256), nn.ReLU(),
@@ -52,19 +52,19 @@ def pd_control(target_q, q, kp, target_dq, dq, kd):
 # ================= INITIALIZATION =================
 if __name__ == "__main__":
     
-    # HARDCODED PATHS FOR HACKATHON SPEED
-    CONFIG_FILE = r"C:\Users\arora\OneDrive\Desktop\IIT_Mandi\Sem_4\CS671 Deep Learning\Hackathon\Imitation Learning\unitree_rl_gym\deploy\deploy_mujoco\configs\g1.yaml" 
+    # Update these paths to your system!
+    CONFIG_FILE = r"C:\Users\arora\OneDrive\Desktop\IIT_Mandi\Sem_4\CS671 Deep Learning\Hackathon\Imitation Learning\unitree_rl_gym\deploy\deploy_mujoco\configs\g1.yaml"
     IL_MODEL_PATH = r"C:\Users\arora\OneDrive\Desktop\IIT_Mandi\Sem_4\CS671 Deep Learning\Hackathon\Imitation Learning\G1_bc_brain.pth"
     LEGGED_GYM_ROOT_DIR = r"C:\Users\arora\OneDrive\Desktop\IIT_Mandi\Sem_4\CS671 Deep Learning\Hackathon\Imitation Learning\unitree_rl_gym"
     
-    EMA_ALPHA = 0.3
+    # The "Shock Absorber" - Low value ensures arm movements don't whip the Center of Mass
+    EMA_ALPHA = 0.3 
 
     with open(CONFIG_FILE, "r", encoding="utf-8", errors="ignore") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
     policy_path = config["policy_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
     xml_path = config["xml_path"].replace("{LEGGED_GYM_ROOT_DIR}", LEGGED_GYM_ROOT_DIR)
-    xml_path = r"C:\Users\arora\OneDrive\Desktop\IIT_Mandi\Sem_4\AR524 Robot Simulators\MuJoCo\mujoco_menagerie\unitree_g1\scene.xml"  # ← ADD THIS
 
     simulation_dt = config["simulation_dt"]
     control_decimation = config["control_decimation"]
@@ -82,28 +82,23 @@ if __name__ == "__main__":
     num_actions = config["num_actions"]
     num_obs = config["num_obs"]
     
-    # Positive X = Walk Forward!
+    # Command array initialized (walking forward)
     cmd = np.array([0.2, 0.0, 0.0], dtype=np.float32) 
 
     print("⚙️ Initializing MuJoCo...")
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
-    print(f"Total actuators in loaded XML: {m.nu}")
-    print(f"XML being loaded: {xml_path}")
     m.opt.timestep = simulation_dt
 
+    # Get IDs
+    arm_qpos_ids, arm_qvel_ids = get_joint_state_ids(m, ARM_JOINT_NAMES)
+    arm_act_ids  = get_actuator_ids(m, ARM_JOINT_NAMES)
     leg_act_ids  = get_actuator_ids(m, LEG_JOINT_NAMES)
     leg_qpos_ids, leg_qvel_ids = get_joint_state_ids(m, LEG_JOINT_NAMES)
-    arm_act_ids  = get_actuator_ids(m, ARM_JOINT_NAMES)
-
-# ← ADD THIS
-    for name, aid in zip(ARM_JOINT_NAMES, arm_act_ids):
-        print(f"  {name} → actuator id: {aid}")
-    arm_qpos_ids, arm_qvel_ids = get_joint_state_ids(m, ARM_JOINT_NAMES)
 
     print("🧠 Loading AI Brains...")
     policy = torch.jit.load(policy_path)
-    il_brain = BehavioralCloningMLP(output_dim=29)
+    il_brain = BehavioralCloningMLP(output_dim=8)
     il_brain.load_state_dict(torch.load(IL_MODEL_PATH))
     il_brain.eval()
     
@@ -113,38 +108,30 @@ if __name__ == "__main__":
     socket.connect("tcp://127.0.0.1:5555")
     socket.setsockopt_string(zmq.SUBSCRIBE, "VISION ")
 
-    import time
-    time.sleep(0.5)  # ← ADD THIS LINE, gives ZMQ time to handshake
+    time.sleep(0.5) 
 
     action = np.zeros(num_actions, dtype=np.float32)
     target_dof_pos = default_angles.copy()
     obs = np.zeros(num_obs, dtype=np.float32)
     counter = 0
 
-    # Initialize arms to the safe "Bent A-Pose" to preserve RL balance
+    # Arm variables mapped directly from vitthal.py success
     arm_target = np.zeros(len(ARM_JOINT_NAMES))
-    arm_target[0] = 0.2  # left_shoulder_pitch
-    arm_target[1] = 0.2  # left_shoulder_roll
-    arm_target[3] = 1.28 # left_elbow
-    arm_target[5] = 0.2  # right_shoulder_pitch
-    arm_target[6] = -0.2 # right_shoulder_roll
-    arm_target[8] = 1.28 # right_elbow
+    il_smoothed_output = np.zeros(8)
     
-    # Initialize the AI array to the SAFE BENT POSE so the robot balances instantly
-    il_smoothed_output = np.zeros(29)
-    il_smoothed_output[15:19] = [0.2, 0.2, 0.0, 1.28]  # Left arm bent
-    il_smoothed_output[22:26] = [0.2, -0.2, 0.0, 1.28] # Right arm bent
-
+    # PD Gains from vitthal.py
+    kp_arm = 200
+    kd_arm = 10
 
     # ================= SIMULATION LOOP =================
     with mujoco.viewer.launch_passive(m, d) as viewer:
         start = time.time()
-        print("🚀 G1 Vision Fusion Live!")
+        print("🚀 G1 Continuous Teleoperation Live!")
 
         while viewer.is_running():
             step_start = time.time()
 
-            # ===== 1. VISION INFERENCE (BUFFER DRAIN) =====
+            # ===== 1. VISION INFERENCE =====
             received_new_data = False
             try:
                 while True:
@@ -157,25 +144,32 @@ if __name__ == "__main__":
             if received_new_data:
                 with torch.no_grad():
                     il_action = il_brain(torch.tensor(raw_landmarks, dtype=torch.float32).unsqueeze(0)).squeeze().numpy()
+                
+                # EMA filter replaces the "alpha" interpolation from vitthal.py
                 il_smoothed_output = (il_action * EMA_ALPHA) + (il_smoothed_output * (1.0 - EMA_ALPHA))
 
-            # ADD THIS right after the arm_target mapping block:
-            arm_target[0:4] = il_smoothed_output[15:19]
-            arm_target[4] = 0.0
-            arm_target[5:9] = il_smoothed_output[22:26]
-            arm_target[9] = 0.0
+            # --- LEFT ARM ---
+            arm_target[0] = il_smoothed_output[0]    # Pitch 
+            arm_target[1] = il_smoothed_output[1]    # Roll 
+            arm_target[2] = il_smoothed_output[2]    # Yaw
+            arm_target[3] = il_smoothed_output[3]    # Elbow
+            arm_target[4] = 0.0                      # Wrist Locked
 
-            # ← ADD THIS:
-            
+            # --- RIGHT ARM ---
+            arm_target[5] = il_smoothed_output[4]    # Pitch 
+            arm_target[6] = il_smoothed_output[5]    # Roll 
+            arm_target[7] = il_smoothed_output[6]    # Yaw
+            arm_target[8] = il_smoothed_output[7]    # Elbow
+            arm_target[9] = 0.0                      # Wrist Locked
 
-            # ===== 2. MANUAL PD CONTROL (Angles to Torque) =====
-            # ===== 2. DIRECT POSITION CONTROL (correct for position actuators) =====
-            d.ctrl[15:20] = arm_target[0:5]   # left arm: shoulder pitch, roll, yaw, elbow, wrist_roll
-            d.ctrl[22:27] = arm_target[5:10]  # right arm: shoulder pitch, roll, yaw, elbow, wrist_roll
-            if counter % 60 == 0:
-                print(f"[DEBUG] ZMQ alive: {received_new_data} | L arm: {arm_target[0:4].round(3)} | R arm: {arm_target[5:9].round(3)}")
-                print(f"[DEBUG] il_action L: {il_smoothed_output[15:19].round(3)} | il_action R: {il_smoothed_output[22:26].round(3)}")  # ← ADD
-                print(f"[DEBUG] arm_act_ids: {arm_act_ids}")   # ← ADD
+            # ===== 2. ARM CONTROL (PD TORQUE) =====
+            # Exact loop from vitthal.py
+            arm_tau = np.zeros(len(arm_qpos_ids))
+            for i in range(len(arm_qpos_ids)):
+                q = d.qpos[arm_qpos_ids[i]]
+                dq = d.qvel[arm_qvel_ids[i]]
+                arm_tau[i] = (arm_target[i] - q) * kp_arm + (-dq) * kd_arm
+
             # ===== 3. RL INFERENCE (LEGS) =====
             if counter % control_decimation == 0:
                 qj = d.qpos[leg_qpos_ids]
@@ -192,14 +186,23 @@ if __name__ == "__main__":
 
                 obs_tensor = torch.from_numpy(obs).unsqueeze(0)
                 action = policy(obs_tensor).detach().numpy().squeeze()
-
                 target_dof_pos = action * action_scale + default_angles
 
-            # ===== 4. LEG CONTROL (TORQUE) =====
-            # ===== 4. LEG CONTROL (POSITION) =====
-            d.ctrl[leg_act_ids] = target_dof_pos
+            # ===== 4. LEG CONTROL (PD TORQUE) =====
+            # Exactly mapped from vitthal.py
+            leg_tau = pd_control(
+                target_dof_pos,
+                d.qpos[7:7+len(LEG_JOINT_NAMES)],
+                kps,
+                np.zeros_like(kds),
+                d.qvel[6:6+len(LEG_JOINT_NAMES)],
+                kds
+            )
 
-            # ===== 5. STEP =====
+            # ===== 5. APPLY CONTROL & STEP =====
+            d.ctrl[leg_act_ids] = leg_tau
+            d.ctrl[arm_act_ids] = arm_tau
+
             mujoco.mj_step(m, d)
             viewer.sync()
             counter += 1

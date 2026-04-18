@@ -1,99 +1,114 @@
 """
-mp2mujoco.py
-============
-Pipeline: MediaPipe World Landmarks → Unitree G1 MuJoCo Joint Angles
+mp2mujoco.py  –  Unitree G1 edition
+=====================================
+Pipeline: MediaPipe World Landmarks → Unitree G1 MuJoCo Joint Angles (23 DOF)
 
-Stages:
-  1. Landmark extraction  – pull pose landmarks from MediaPipe
-  2. Coordinate alignment – rotate MP frame to G1/MuJoCo frame
-  3. Angle computation    – vectors → joint angles (rotation decomposition)
-  4. Joint limit clamping – enforce G1 hardware limits
-  5. Dataset recording    – accumulate frames, save to HDF5 / CSV / NPZ
+G1 additions vs H1
+───────────────────
+  • ankle_roll  (×2)  – lateral ankle tilt, estimated from foot-plane orientation
+  • wrist_roll  (×2)  – forearm supination/pronation, estimated from hand-plane
+  • waist gains roll + pitch on top of yaw  (3-DOF waist)
+  → total DOF: 1(waist_yaw) + 6(L-leg) + 6(R-leg) + 5(L-arm) + 5(R-arm) = 23
+
+Coordinate conventions
+────────────────────────
+  MediaPipe world :  x→right,   y→up,      z→toward-camera   (right-hand)
+  MuJoCo / G1    :  x→forward, y→left,    z→up               (right-hand)
+  Rotation used  :  v_mj = R_MP2MJ @ v_mp
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-import cv2
 import h5py
-import mediapipe as mp
 import numpy as np
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1.  MEDIAPIPE LANDMARK INDEX MAP
+# 1.  MEDIAPIPE LANDMARK INDICES
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MP:
-    """MediaPipe Pose landmark indices (WORLD coordinates, hip-centred, metres)."""
-    NOSE            = 0
-    LEFT_SHOULDER   = 11
-    RIGHT_SHOULDER  = 12
-    LEFT_ELBOW      = 13
-    RIGHT_ELBOW     = 14
-    LEFT_WRIST      = 15
-    RIGHT_WRIST     = 16
-    LEFT_HIP        = 23
-    RIGHT_HIP       = 24
-    LEFT_KNEE       = 25
-    RIGHT_KNEE      = 26
-    LEFT_ANKLE      = 27
-    RIGHT_ANKLE     = 28
-    LEFT_HEEL       = 29
-    RIGHT_HEEL      = 30
-    LEFT_FOOT_INDEX = 31
-    RIGHT_FOOT_INDEX= 32
+    """MediaPipe BlazePose 33-landmark indices."""
+    NOSE             = 0
+    LEFT_SHOULDER    = 11;  RIGHT_SHOULDER   = 12
+    LEFT_ELBOW       = 13;  RIGHT_ELBOW      = 14
+    LEFT_WRIST       = 15;  RIGHT_WRIST      = 16
+    LEFT_PINKY       = 17;  RIGHT_PINKY      = 18
+    LEFT_INDEX       = 19;  RIGHT_INDEX      = 20
+    LEFT_THUMB       = 21;  RIGHT_THUMB      = 22
+    LEFT_HIP         = 23;  RIGHT_HIP        = 24
+    LEFT_KNEE        = 25;  RIGHT_KNEE       = 26
+    LEFT_ANKLE       = 27;  RIGHT_ANKLE      = 28
+    LEFT_HEEL        = 29;  RIGHT_HEEL       = 30
+    LEFT_FOOT_INDEX  = 31;  RIGHT_FOOT_INDEX = 32
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2.  UNITREE G1 JOINT SPEC
+# 2.  UNITREE G1 JOINT SPECIFICATION  (23 DOF)
+#     Limits from official Unitree G1 URDF / MuJoCo Menagerie g1.xml
 # ──────────────────────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────────────
-# 2.  UNITREE G1 JOINT SPEC (29 DOFs)
-# ──────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class JointSpec:
-    name:  str
-    lo:    float
-    hi:    float
+    name: str
+    lo:   float   # lower limit (rad)
+    hi:   float   # upper limit (rad)
 
 G1_JOINTS: list[JointSpec] = [
-    # Legs (0-11) - We will output 0 here because RL handles legs
-    JointSpec("left_hip_pitch", -2.53, 2.87), JointSpec("left_hip_roll", -0.52, 2.96), JointSpec("left_hip_yaw", -2.75, 2.75),
-    JointSpec("left_knee", -0.08, 2.87), JointSpec("left_ankle_pitch", -0.87, 0.52), JointSpec("left_ankle_roll", -0.26, 0.26),
-    JointSpec("right_hip_pitch", -2.53, 2.87), JointSpec("right_hip_roll", -2.96, 0.52), JointSpec("right_hip_yaw", -2.75, 2.75),
-    JointSpec("right_knee", -0.08, 2.87), JointSpec("right_ankle_pitch", -0.87, 0.52), JointSpec("right_ankle_roll", -0.26, 0.26),
 
-    # Waist (12-14)
-    JointSpec("waist_yaw", -2.618, 2.618), JointSpec("waist_roll", -0.52, 0.52), JointSpec("waist_pitch", -0.52, 0.52),
+    # ── Waist (3 DOF) ──────────────────────────────────────────────────────
+    JointSpec("waist_yaw",             -2.618,  2.618),
+    JointSpec("waist_roll",            -0.523,  0.523),
+    JointSpec("waist_pitch",           -0.785,  0.785),
 
-    # Left Arm (15-21)
-    JointSpec("left_shoulder_pitch", -3.08, 2.67), JointSpec("left_shoulder_roll", -1.58, 2.25), JointSpec("left_shoulder_yaw", -2.61, 2.61),
-    JointSpec("left_elbow", -1.04, 2.09),
-    JointSpec("left_wrist_roll", -1.97, 1.97), JointSpec("left_wrist_pitch", -1.61, 1.61), JointSpec("left_wrist_yaw", -1.61, 1.61),
+    # ── Left Leg (6 DOF) ───────────────────────────────────────────────────
+    JointSpec("left_hip_pitch",        -1.047,  2.094),
+    JointSpec("left_hip_roll",         -0.524,  2.967),
+    JointSpec("left_hip_yaw",          -2.758,  2.758),
+    JointSpec("left_knee",             -0.087,  2.880),
+    JointSpec("left_ankle_pitch",      -0.873,  0.524),
+    JointSpec("left_ankle_roll",       -0.262,  0.262),
 
-    # Right Arm (22-28)
-    JointSpec("right_shoulder_pitch", -3.08, 2.67), JointSpec("right_shoulder_roll", -2.25, 1.58), JointSpec("right_shoulder_yaw", -2.61, 2.61),
-    JointSpec("right_elbow", -1.04, 2.09),
-    JointSpec("right_wrist_roll", -1.97, 1.97), JointSpec("right_wrist_pitch", -1.61, 1.61), JointSpec("right_wrist_yaw", -1.61, 1.61),
+    # ── Right Leg (6 DOF) ──────────────────────────────────────────────────
+    JointSpec("right_hip_pitch",       -1.047,  2.094),
+    JointSpec("right_hip_roll",        -2.967,  0.524),
+    JointSpec("right_hip_yaw",         -2.758,  2.758),
+    JointSpec("right_knee",            -0.087,  2.880),
+    JointSpec("right_ankle_pitch",     -0.873,  0.524),
+    JointSpec("right_ankle_roll",      -0.262,  0.262),
+
+    # ── Left Arm (5 DOF) ───────────────────────────────────────────────────
+    JointSpec("left_shoulder_pitch",   -3.089,  2.670),
+    JointSpec("left_shoulder_roll",    -1.588,  2.252),
+    JointSpec("left_shoulder_yaw",     -2.618,  2.618),
+    JointSpec("left_elbow",            -1.047,  2.094),
+    JointSpec("left_wrist_roll",       -1.972,  1.972),
+
+    # ── Right Arm (5 DOF) ──────────────────────────────────────────────────
+    JointSpec("right_shoulder_pitch",  -3.089,  2.670),
+    JointSpec("right_shoulder_roll",   -2.252,  1.588),
+    JointSpec("right_shoulder_yaw",    -2.618,  2.618),
+    JointSpec("right_elbow",           -1.047,  2.094),
+    JointSpec("right_wrist_roll",      -1.972,  1.972),
 ]
 
 JOINT_NAMES = [j.name for j in G1_JOINTS]
-DOF = len(G1_JOINTS) # 29
+DOF         = len(G1_JOINTS)   # 23
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  FRAME  (one timestep of output)
+# 3.  OUTPUT FRAME
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class G1Frame:
-    timestamp:  float
-    angles:     np.ndarray          # shape (DOF,) in radians
-    confidence: float               # mean landmark visibility [0,1]
-    raw_landmarks: np.ndarray       # shape (33, 3) world coords
+    timestamp:     float
+    angles:        np.ndarray   # (23,) radians
+    confidence:    float        # mean landmark visibility [0, 1]
+    raw_landmarks: np.ndarray   # (33, 3) MediaPipe world coords
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -102,278 +117,384 @@ class G1Frame:
 
 def _unit(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
-    return v / n if n > 1e-8 else v
+    return v / n if n > 1e-8 else np.zeros_like(v)
 
 def _angle_between(a: np.ndarray, b: np.ndarray) -> float:
-    """Unsigned angle between two vectors (rad)."""
-    cos = np.clip(np.dot(_unit(a), _unit(b)), -1.0, 1.0)
-    return float(np.arccos(cos))
+    """Unsigned angle between two 3-vectors (rad)."""
+    c = np.clip(np.dot(_unit(a), _unit(b)), -1.0, 1.0)
+    return float(np.arccos(c))
 
 def _signed_angle(v1: np.ndarray, v2: np.ndarray, axis: np.ndarray) -> float:
-    """Signed angle from v1 to v2 around `axis` (right-hand rule)."""
+    """Signed angle from v1 → v2 around `axis` (right-hand rule)."""
     cross = np.cross(v1, v2)
-    s = np.linalg.norm(cross)
-    c = np.dot(v1, v2)
-    angle = np.arctan2(s, c)
-    if np.dot(cross, axis) < 0:
-        angle = -angle
-    return float(angle)
-
-def _decompose_elbow(proximal: np.ndarray, distal: np.ndarray) -> float:
-    """Return elbow flexion angle (always ≥ 0 for G1)."""
-    return _angle_between(proximal, distal)
+    angle = np.arctan2(np.linalg.norm(cross), np.dot(v1, v2))
+    return float(-angle if np.dot(cross, axis) < 0 else angle)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5.  COORDINATE FRAME ALIGNMENT
-#     MediaPipe world:  x→right, y→up,   z→toward camera  (right-hand)
-#     MuJoCo / G1:      x→forward, y→left, z→up            (right-hand)
+#     v_mujoco = R_MP2MJ @ v_mediapipe
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Rotation matrix  R such that  v_mujoco = R @ v_mediapipe
 _R_MP2MJ = np.array([
-    [ 0,  0, -1],   # mj-x ← -mp-z  (forward = depth into scene)
-    [-1,  0,  0],   # mj-y ← -mp-x  (left)
-    [ 0,  1,  0],   # mj-z ←  mp-y  (up)
+    [ 0,  0, -1],   # mj-x ←  -mp-z  (forward = depth into scene)
+    [-1,  0,  0],   # mj-y ←  -mp-x  (left)
+    [ 0,  1,  0],   # mj-z ←   mp-y  (up)
 ], dtype=float)
 
-def _lm_to_mj(lm) -> np.ndarray:
-    """Extract world landmark as MuJoCo-frame 3-vector."""
-    mp_vec = np.array([lm.x, lm.y, lm.z])
-    return _R_MP2MJ @ mp_vec
-
-def _get_pos(lms, idx: int) -> np.ndarray:
-    return _lm_to_mj(lms[idx])
+def _p(lms, idx: int) -> np.ndarray:
+    """Landmark → MuJoCo-frame position vector."""
+    lm = lms[idx]
+    return _R_MP2MJ @ np.array([lm.x, lm.y, lm.z])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6.  ANGLE COMPUTATION FUNCTIONS
-#     Each function receives the full landmark array and returns radians.
+# 6.  PELVIS / TRUNK FRAME  (shared across hip + waist)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _torso_yaw(lms) -> float:
-    """Shoulder-line yaw relative to world forward (+x)."""
-    ls = _get_pos(lms, MP.LEFT_SHOULDER)
-    rs = _get_pos(lms, MP.RIGHT_SHOULDER)
-    shoulder_vec = ls - rs          # points left
-    # project onto horizontal plane
-    shoulder_flat = np.array([shoulder_vec[0], shoulder_vec[1], 0.0])
-    world_left    = np.array([0.0, 1.0, 0.0])
-    return _signed_angle(world_left, shoulder_flat, np.array([0, 0, 1]))
-
-
-def _hip_angles(lms, side: str):
+def _pelvis_frame(lms):
     """
-    Returns (yaw, roll, pitch) for one hip.
-    Uses pelvis-relative thigh vector decomposed onto anatomical axes.
+    Returns (right, fwd, up) orthonormal basis of the pelvis in MuJoCo world.
+    right = from left-hip to right-hip
+    fwd   = pelvis forward (cross of right × world_up, projected)
+    up    = completes right-hand frame
     """
-    if side == "left":
-        hip_idx, knee_idx = MP.LEFT_HIP, MP.LEFT_KNEE
-        sign = 1.0
-    else:
-        hip_idx, knee_idx = MP.RIGHT_HIP, MP.RIGHT_KNEE
-        sign = -1.0
+    lh = _p(lms, MP.LEFT_HIP)
+    rh = _p(lms, MP.RIGHT_HIP)
+    right = _unit(rh - lh)
+    world_up = np.array([0., 0., 1.])
+    fwd = _unit(np.cross(right, world_up))
+    up  = _unit(np.cross(fwd, right))       # ≈ world_up corrected for tilt
+    return right, fwd, up
 
-    # Pelvis frame axes (in MuJoCo world frame)
-    lh = _get_pos(lms, MP.LEFT_HIP)
-    rh = _get_pos(lms, MP.RIGHT_HIP)
-    pelvis_right = _unit(rh - lh)               # +x of pelvis (points right)
-    world_up     = np.array([0., 0., 1.])
-    pelvis_fwd   = _unit(np.cross(pelvis_right, world_up))  # +y pelvis
-    pelvis_up    = _unit(np.cross(pelvis_fwd, pelvis_right))
 
-    # Thigh vector in pelvis frame
-    hip  = _get_pos(lms, hip_idx)
-    knee = _get_pos(lms, knee_idx)
-    thigh_world = _unit(knee - hip)
+def _shoulder_mid(lms) -> np.ndarray:
+    return (_p(lms, MP.LEFT_SHOULDER) + _p(lms, MP.RIGHT_SHOULDER)) * 0.5
 
-    # Decompose
-    pitch = float(np.arcsin(np.clip(np.dot(thigh_world, pelvis_fwd), -1, 1)))
-    roll  = float(np.arcsin(np.clip(np.dot(thigh_world, pelvis_right) * sign, -1, 1)))
+def _hip_mid(lms) -> np.ndarray:
+    return (_p(lms, MP.LEFT_HIP) + _p(lms, MP.RIGHT_HIP)) * 0.5
 
-    # Yaw: rotation of thigh around vertical axis (abduction/adduction plane)
-    thigh_horiz = _unit(np.array([thigh_world[0], thigh_world[1], 0.0]) + 1e-9)
-    ref_horiz   = _unit(np.array([pelvis_fwd[0], pelvis_fwd[1], 0.0]) + 1e-9)
-    yaw = _signed_angle(ref_horiz, thigh_horiz, world_up) * sign
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7.  ANGLE ESTIMATORS
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── 7a. Waist ─────────────────────────────────────────────────────────────────
+
+def _waist_angles(lms):
+    """
+    Returns (yaw, roll, pitch) of the torso relative to the pelvis.
+
+    Strategy
+    ────────
+    Pelvis frame  – defined by hip line (right axis) + world up
+    Torso frame   – defined by shoulder line (right axis) + shoulder-to-hip vector
+    We decompose the rotation between them into yaw / roll / pitch components.
+    """
+    p_right, p_fwd, p_up = _pelvis_frame(lms)
+
+    ls  = _p(lms, MP.LEFT_SHOULDER)
+    rs  = _p(lms, MP.RIGHT_SHOULDER)
+    t_right = _unit(rs - ls)                      # torso right axis
+
+    world_up = np.array([0., 0., 1.])
+    t_fwd    = _unit(np.cross(t_right, world_up))
+    t_up     = _unit(np.cross(t_fwd, t_right))
+
+    # Torso spine vector (hip-mid → shoulder-mid)
+    spine = _unit(_shoulder_mid(lms) - _hip_mid(lms))
+
+    # Yaw: rotation of torso-right around world-up relative to pelvis-right
+    yaw   = _signed_angle(
+        np.array([p_right[0], p_right[1], 0.]),
+        np.array([t_right[0], t_right[1], 0.]),
+        world_up
+    )
+
+    # Roll: lateral lean – angle of spine away from p_up in coronal plane
+    # Project spine onto (p_right, p_up) plane
+    roll  = float(np.arcsin(np.clip(np.dot(spine, p_right), -1, 1)))
+
+    # Pitch: forward lean – angle of spine away from p_up in sagittal plane
+    pitch = float(np.arcsin(np.clip(-np.dot(spine, p_fwd),  -1, 1)))
 
     return yaw, roll, pitch
 
 
+# ── 7b. Hip ───────────────────────────────────────────────────────────────────
+
+def _hip_angles(lms, side: str):
+    """
+    Returns (pitch, roll, yaw) for one hip in the pelvis frame.
+    G1 URDF order: hip_pitch, hip_roll, hip_yaw.
+    """
+    hip_idx  = MP.LEFT_HIP   if side == "left" else MP.RIGHT_HIP
+    knee_idx = MP.LEFT_KNEE  if side == "left" else MP.RIGHT_KNEE
+    sign     = 1.0            if side == "left" else -1.0
+
+    p_right, p_fwd, p_up = _pelvis_frame(lms)
+
+    hip  = _p(lms, hip_idx)
+    knee = _p(lms, knee_idx)
+    thigh = _unit(knee - hip)          # points downward in neutral
+
+    # Pitch = flexion / extension  (forward tilt of thigh)
+    # Positive pitch = hip flexion (thigh forward)
+    pitch = float(np.arcsin(np.clip(np.dot(thigh, p_fwd), -1, 1)))
+
+    # Roll = abduction / adduction (lateral tilt, sign-flipped for right side)
+    roll  = float(np.arcsin(np.clip(np.dot(thigh, p_right) * sign, -1, 1)))
+
+    # Yaw = internal / external rotation (horizontal plane)
+    thigh_horiz = _unit(np.array([thigh[0], thigh[1], 0.]) + 1e-9)
+    ref_horiz   = _unit(np.array([p_fwd[0],  p_fwd[1],  0.]) + 1e-9)
+    yaw = _signed_angle(ref_horiz, thigh_horiz, np.array([0., 0., 1.])) * sign
+
+    return pitch, roll, yaw
+
+
+# ── 7c. Knee ──────────────────────────────────────────────────────────────────
+
 def _knee_angle(lms, side: str) -> float:
-    """Knee flexion via hip-knee-ankle angle (always positive for G1)."""
-    if side == "left":
-        h, k, a = MP.LEFT_HIP, MP.LEFT_KNEE, MP.LEFT_ANKLE
-    else:
-        h, k, a = MP.RIGHT_HIP, MP.RIGHT_KNEE, MP.RIGHT_ANKLE
+    """Knee flexion (hip-knee-ankle). 0 = fully extended, positive = flexed."""
+    h = MP.LEFT_HIP   if side == "left" else MP.RIGHT_HIP
+    k = MP.LEFT_KNEE  if side == "left" else MP.RIGHT_KNEE
+    a = MP.LEFT_ANKLE if side == "left" else MP.RIGHT_ANKLE
 
-    hip   = _get_pos(lms, h)
-    knee  = _get_pos(lms, k)
-    ankle = _get_pos(lms, a)
-
-    thigh  = knee  - hip
-    shank  = ankle - knee
-    angle  = np.pi - _angle_between(thigh, shank)   # 0 = straight
-    return max(0.0, float(angle))
+    thigh = _p(lms, k) - _p(lms, h)
+    shank = _p(lms, a) - _p(lms, k)
+    # Supplementary angle → 0 when leg is straight
+    return max(0.0, float(np.pi - _angle_between(thigh, shank)))
 
 
-def _ankle_angle(lms, side: str) -> float:
+# ── 7d. Ankle ─────────────────────────────────────────────────────────────────
+
+def _ankle_angles(lms, side: str):
     """
-    Ankle dorsi/plantarflexion from shank-foot angle.
-    Negative = dorsiflexion, Positive = plantarflexion (G1 convention).
+    Returns (pitch, roll) for the ankle.
+
+    pitch – dorsi/plantarflexion  (sagittal, shank vs foot longitudinal axis)
+    roll  – inversion/eversion    (coronal,  foot tilt; NEW in G1 vs H1)
     """
-    if side == "left":
-        k, a, f = MP.LEFT_KNEE, MP.LEFT_ANKLE, MP.LEFT_FOOT_INDEX
-    else:
-        k, a, f = MP.RIGHT_KNEE, MP.RIGHT_ANKLE, MP.RIGHT_FOOT_INDEX
+    k  = MP.LEFT_KNEE       if side == "left" else MP.RIGHT_KNEE
+    a  = MP.LEFT_ANKLE      if side == "left" else MP.RIGHT_ANKLE
+    h  = MP.LEFT_HEEL       if side == "left" else MP.RIGHT_HEEL
+    fi = MP.LEFT_FOOT_INDEX if side == "left" else MP.RIGHT_FOOT_INDEX
 
-    knee  = _get_pos(lms, k)
-    ankle = _get_pos(lms, a)
-    foot  = _get_pos(lms, f)
+    knee  = _p(lms, k)
+    ankle = _p(lms, a)
+    heel  = _p(lms, h)
+    foot  = _p(lms, fi)
 
-    shank = _unit(ankle - knee)
-    foot_vec = _unit(foot  - ankle)
-    # Signed in sagittal plane
-    sag_axis = np.array([0., 1., 0.])      # Y = left (sagittal normal)
-    return _signed_angle(shank, foot_vec, sag_axis)
+    shank      = _unit(ankle - knee)
+    foot_long  = _unit(foot  - heel)        # heel → toe = longitudinal foot axis
+    foot_lat   = _unit(np.cross(foot_long, shank))  # lateral foot axis
 
+    # Sagittal axis = lateral foot direction
+    pitch = _signed_angle(shank, foot_long, foot_lat)
+
+    # Roll: foot lateral tilt relative to world-up, projected in coronal plane
+    world_up  = np.array([0., 0., 1.])
+    foot_norm = _unit(np.cross(foot_long, world_up) + 1e-9)  # ≈ medial direction
+    roll = _signed_angle(world_up, _unit(np.cross(foot_long, foot_lat)), foot_long)
+    roll *= (1.0 if side == "left" else -1.0)
+
+    return float(pitch), float(roll)
+
+
+# ── 7e. Shoulder ──────────────────────────────────────────────────────────────
 
 def _shoulder_angles(lms, side: str):
     """
     Returns (pitch, roll, yaw) in G1 shoulder convention.
-    Pitch  – flexion/extension (sagittal)
-    Roll   – abduction/adduction (coronal)
-    Yaw    – internal/external rotation (transverse)
+    pitch – flexion/extension
+    roll  – abduction/adduction
+    yaw   – internal/external rotation
     """
-    if side == "left":
-        s_idx, e_idx, opp_s = MP.LEFT_SHOULDER, MP.LEFT_ELBOW,  MP.RIGHT_SHOULDER
-        roll_sign = 1.0
-    else:
-        s_idx, e_idx, opp_s = MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.LEFT_SHOULDER
-        roll_sign = -1.0
+    s_idx  = MP.LEFT_SHOULDER  if side == "left" else MP.RIGHT_SHOULDER
+    e_idx  = MP.LEFT_ELBOW     if side == "left" else MP.RIGHT_ELBOW
+    o_idx  = MP.RIGHT_SHOULDER if side == "left" else MP.LEFT_SHOULDER
+    roll_s = 1.0               if side == "left" else -1.0
 
-    shoulder = _get_pos(lms, s_idx)
-    elbow    = _get_pos(lms, e_idx)
-    opp_sh   = _get_pos(lms, opp_s)
+    shoulder = _p(lms, s_idx)
+    elbow    = _p(lms, e_idx)
+    opp_sh   = _p(lms, o_idx)
 
-    # Shoulder frame
     trunk_right = _unit(opp_sh - shoulder) * (-1 if side == "left" else 1)
     world_up    = np.array([0., 0., 1.])
     trunk_fwd   = _unit(np.cross(trunk_right, world_up))
 
     upper_arm = _unit(elbow - shoulder)
 
-    pitch = float(np.arcsin(np.clip( np.dot(upper_arm, trunk_fwd),  -1, 1)))
-    roll  = float(np.arcsin(np.clip( np.dot(upper_arm, world_up),   -1, 1))) * roll_sign
-    # Yaw from projection onto horizontal plane
-    ua_horiz = _unit(np.array([upper_arm[0], upper_arm[1], 0.0]) + 1e-9)
-    ref      = _unit(np.array([trunk_fwd[0], trunk_fwd[1], 0.0]) + 1e-9)
-    yaw = _signed_angle(ref, ua_horiz, world_up)
+    pitch = float(np.arcsin(np.clip( np.dot(upper_arm, trunk_fwd), -1, 1)))
+    roll  = float(np.arcsin(np.clip( np.dot(upper_arm, world_up),  -1, 1))) * roll_s
+
+    ua_h  = _unit(np.array([upper_arm[0], upper_arm[1], 0.]) + 1e-9)
+    ref_h = _unit(np.array([trunk_fwd[0], trunk_fwd[1], 0.]) + 1e-9)
+    yaw   = _signed_angle(ref_h, ua_h, world_up)
 
     return pitch, roll, yaw
 
 
+# ── 7f. Elbow ─────────────────────────────────────────────────────────────────
+
 def _elbow_angle(lms, side: str) -> float:
-    """Elbow flexion (shoulder-elbow-wrist angle, always ≥ 0)."""
-    if side == "left":
-        s, e, w = MP.LEFT_SHOULDER, MP.LEFT_ELBOW, MP.LEFT_WRIST
-    else:
-        s, e, w = MP.RIGHT_SHOULDER, MP.RIGHT_ELBOW, MP.RIGHT_WRIST
+    """Elbow flexion via shoulder-elbow-wrist angle. Always ≥ 0."""
+    s = MP.LEFT_SHOULDER if side == "left" else MP.RIGHT_SHOULDER
+    e = MP.LEFT_ELBOW    if side == "left" else MP.RIGHT_ELBOW
+    w = MP.LEFT_WRIST    if side == "left" else MP.RIGHT_WRIST
 
-    shoulder = _get_pos(lms, s)
-    elbow    = _get_pos(lms, e)
-    wrist    = _get_pos(lms, w)
+    upper = _p(lms, e) - _p(lms, s)
+    lower = _p(lms, w) - _p(lms, e)
+    return max(0.0, float(np.pi - _angle_between(upper, lower)))
 
-    upper = elbow - shoulder
-    lower = wrist - elbow
-    return max(0.0, np.pi - _angle_between(upper, lower))
+
+# ── 7g. Wrist Roll  (NEW – G1 specific) ──────────────────────────────────────
+
+def _wrist_roll(lms, side: str) -> float:
+    """
+    Forearm supination / pronation (rotation around the forearm long axis).
+
+    Strategy
+    ────────
+    1.  Forearm axis  = unit(wrist − elbow)
+    2.  Reference hand-plane normal: elbow-wrist × elbow-upward  (neutral = palm down)
+    3.  Actual hand-plane normal:    forearm × (index − pinky)
+    4.  Roll = signed angle between reference and actual normals, around forearm axis.
+
+    MediaPipe hand landmarks used: index_tip, pinky_tip (wrist-level proxies).
+    Positive = supination (palm up), Negative = pronation (palm down).
+    """
+    e_idx = MP.LEFT_ELBOW  if side == "left" else MP.RIGHT_ELBOW
+    w_idx = MP.LEFT_WRIST  if side == "left" else MP.RIGHT_WRIST
+    i_idx = MP.LEFT_INDEX  if side == "left" else MP.RIGHT_INDEX
+    p_idx = MP.LEFT_PINKY  if side == "left" else MP.RIGHT_PINKY
+
+    elbow  = _p(lms, e_idx)
+    wrist  = _p(lms, w_idx)
+    index  = _p(lms, i_idx)
+    pinky  = _p(lms, p_idx)
+
+    forearm = _unit(wrist - elbow)
+
+    # Actual hand lateral vector (index → pinky, projected perpendicular to forearm)
+    hand_lat_raw = pinky - index
+    hand_lat = _unit(hand_lat_raw - np.dot(hand_lat_raw, forearm) * forearm)
+
+    # Reference lateral vector (world-up projected perpendicular to forearm)
+    world_up  = np.array([0., 0., 1.])
+    ref_lat   = world_up - np.dot(world_up, forearm) * forearm
+    ref_lat   = _unit(ref_lat + 1e-9)
+
+    roll = _signed_angle(ref_lat, hand_lat, forearm)
+    # Flip sign for right arm so that "palm up" is positive on both sides
+    if side == "right":
+        roll = -roll
+
+    return float(roll)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  MAIN CONVERTER
+# 8.  MAIN CONVERTER
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MediaPipeToG1:
+    """
+    Converts a single MediaPipe world-landmark frame into a 23-DOF G1Frame.
+
+    Usage
+    ─────
+    converter = MediaPipeToG1()
+    frame = converter.convert(results.pose_world_landmarks.landmark)
+    print(frame.angles.shape)   # (23,)
+    print(dict(zip(JOINT_NAMES, frame.angles)))
+    """
+
     def __init__(self, confidence_threshold: float = 0.5):
         self.confidence_threshold = confidence_threshold
-        # These now load 29 limits from G1_JOINTS
-        self._lo = np.array([j.lo for j in G1_JOINTS])
-        self._hi = np.array([j.hi for j in G1_JOINTS])
+        self._lo = np.array([j.lo for j in G1_JOINTS], dtype=np.float32)
+        self._hi = np.array([j.hi for j in G1_JOINTS], dtype=np.float32)
 
+    # ──────────────────────────────────────────────────────────────────────────
     def convert(self, world_landmarks, timestamp: float | None = None) -> G1Frame:
         lms = world_landmarks
+        ts  = timestamp or time.time()
 
-        # Mean landmark visibility as quality proxy
-        visibilities = np.array([lm.visibility for lm in lms])
-        confidence   = float(np.mean(visibilities))
+        confidence = float(np.mean([lm.visibility for lm in lms]))
+        raw        = np.array([[lm.x, lm.y, lm.z] for lm in lms], dtype=np.float32)
 
-        # Raw landmark array (for dataset storage)
-        raw = np.array([[lm.x, lm.y, lm.z] for lm in lms])
+        # ── Waist ──────────────────────────────────────────────────────────
+        w_yaw, w_roll, w_pitch = _waist_angles(lms)
 
-        # ── Compute Upper Body Angles ───────────────────────────────────────
-        # We skip computing legs here because the RL policy handles them natively!
-        torso_y = _torso_yaw(lms)
-        lsp, lsr, lsy = _shoulder_angles(lms, "left")
+        # ── Left Leg ───────────────────────────────────────────────────────
+        lhp, lhr, lhy  = _hip_angles(lms, "left")
+        lk             = _knee_angle(lms, "left")
+        lap, lar       = _ankle_angles(lms, "left")
+
+        # ── Right Leg ──────────────────────────────────────────────────────
+        rhp, rhr, rhy  = _hip_angles(lms, "right")
+        rk             = _knee_angle(lms, "right")
+        rap, rar       = _ankle_angles(lms, "right")
+
+        # ── Left Arm ───────────────────────────────────────────────────────
+        lsp, lsr, lsy  = _shoulder_angles(lms, "left")
         le             = _elbow_angle(lms, "left")
-        rsp, rsr, rsy = _shoulder_angles(lms, "right")
+        lwr            = _wrist_roll(lms, "left")
+
+        # ── Right Arm ──────────────────────────────────────────────────────
+        rsp, rsr, rsy  = _shoulder_angles(lms, "right")
         re             = _elbow_angle(lms, "right")
+        rwr            = _wrist_roll(lms, "right")
 
-        # ── Pack in G1 joint order (29 DOFs) ────────────────────────────────
-        # Initialize an array of 29 zeros
-        angles = np.zeros(29, dtype=np.float32)
-        
-        # Insert the calculated angles into the specific G1 arm/waist indices
-        angles[12] = torso_y # Waist Yaw
-        
-        # Left Arm (Shoulder Pitch, Roll, Yaw, Elbow)
-        angles[15], angles[16], angles[17], angles[18] = lsp, lsr, lsy, le 
-        
-        # Right Arm (Shoulder Pitch, Roll, Yaw, Elbow)
-        angles[22], angles[23], angles[24], angles[25] = rsp, rsr, rsy, re 
+        # ── Pack in G1 joint order ─────────────────────────────────────────
+        angles = np.array([
+            w_yaw, w_roll, w_pitch,           # waist  (3)
+            lhp, lhr, lhy, lk, lap, lar,      # L-leg  (6)
+            rhp, rhr, rhy, rk, rap, rar,      # R-leg  (6)
+            lsp, lsr, lsy, le, lwr,            # L-arm  (5)
+            rsp, rsr, rsy, re, rwr,            # R-arm  (5)
+        ], dtype=np.float32)
 
-        # ── Clamp to hardware limits ────────────────────────────────────────
-        # Now shapes match: (29,) clamped against (29,) and (29,)
-        angles = np.clip(angles, self._lo, self._hi).astype(np.float32)
+        # ── Clamp to hardware limits ───────────────────────────────────────
+        angles = np.clip(angles, self._lo, self._hi)
 
         return G1Frame(
-            timestamp     = timestamp or time.time(),
+            timestamp     = ts,
             angles        = angles,
             confidence    = confidence,
             raw_landmarks = raw,
         )
 
+    # ──────────────────────────────────────────────────────────────────────────
     def is_valid(self, frame: G1Frame) -> bool:
-        """Check whether the frame meets minimum quality."""
         return frame.confidence >= self.confidence_threshold
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  DATASET RECORDER
+# 9.  DATASET RECORDER
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DatasetRecorder:
     """
-    Accumulates G1Frame objects and writes them to disk.
+    Accumulates G1Frame objects and persists them to disk.
 
-    Supported formats:
-      • HDF5  (.h5)  – recommended for large datasets with metadata
-      • NPZ   (.npz) – NumPy compressed archive
-      • CSV   (.csv) – human-readable, angles only
-
-    Usage
-    -----
-    rec = DatasetRecorder(max_frames=3000)
-    rec.record(frame)
-    rec.save("dataset.h5")
+    Formats
+    ───────
+    .h5  / .hdf5  – HDF5 (recommended; stores metadata, compresses well)
+    .npz           – NumPy compressed archive
+    .csv           – human-readable angles-only table
     """
 
-    def __init__(self, max_frames: int = 10_000):
-        self.max_frames = max_frames
-        self._timestamps:  list[float]     = []
-        self._angles:      list[np.ndarray]= []
-        self._confidences: list[float]     = []
-        self._landmarks:   list[np.ndarray]= []
+    def __init__(self, max_frames: int = 30_000):
+        self.max_frames    = max_frames
+        self._timestamps:  list[float]      = []
+        self._angles:      list[np.ndarray] = []
+        self._confidences: list[float]      = []
+        self._landmarks:   list[np.ndarray] = []
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     def record(self, frame: G1Frame) -> bool:
-        """Returns False when buffer is full."""
+        """Append frame. Returns False when buffer is full."""
         if len(self._timestamps) >= self.max_frames:
             return False
         self._timestamps.append(frame.timestamp)
@@ -382,51 +503,71 @@ class DatasetRecorder:
         self._landmarks.append(frame.raw_landmarks)
         return True
 
+    def clear(self):
+        self._timestamps.clear()
+        self._angles.clear()
+        self._confidences.clear()
+        self._landmarks.clear()
+
     @property
     def n_frames(self) -> int:
         return len(self._timestamps)
 
-    # ------------------------------------------------------------------
-    def save(self, path: str | Path, fmt: str = "h5") -> Path:
-        path = Path(path)
-        fmt  = path.suffix.lstrip(".") or fmt
+    # ──────────────────────────────────────────────────────────────────────────
+    def save(self, path: str | Path, label: str = "") -> Path:
+        """
+        Save dataset to disk. Format inferred from extension.
+        `label` is an optional gesture/action tag stored as metadata.
+        """
+        path  = Path(path)
+        fmt   = path.suffix.lstrip(".")
+        N     = self.n_frames
 
-        angles_arr = np.stack(self._angles)                 # (N, 19)
-        ts_arr     = np.array(self._timestamps)             # (N,)
-        conf_arr   = np.array(self._confidences)            # (N,)
-        lm_arr     = np.stack(self._landmarks)              # (N, 33, 3)
+        if N == 0:
+            raise RuntimeError("No frames to save.")
+
+        ts_arr  = np.array(self._timestamps,                dtype=np.float64)
+        ang_arr = np.stack(self._angles).astype(np.float32)   # (N, 23)
+        cf_arr  = np.array(self._confidences,               dtype=np.float32)
+        lm_arr  = np.stack(self._landmarks).astype(np.float32) # (N, 33, 3)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
 
         if fmt in ("h5", "hdf5"):
             with h5py.File(path, "w") as f:
-                f.attrs["robot"]       = "unitree_G1"
+                f.attrs["robot"]       = "unitree_g1"
                 f.attrs["source"]      = "mediapipe_world_landmarks"
                 f.attrs["dof"]         = DOF
-                f.attrs["joint_names"] = np.bytes_(JOINT_NAMES)
-                f.create_dataset("timestamps",  data=ts_arr,     compression="gzip")
-                f.create_dataset("angles",      data=angles_arr, compression="gzip")
-                f.create_dataset("confidence",  data=conf_arr,   compression="gzip")
-                f.create_dataset("landmarks",   data=lm_arr,     compression="gzip")
+                f.attrs["label"]       = label
+                f.attrs["joint_names"] = [n.encode() for n in JOINT_NAMES]
+                kw = dict(compression="gzip", compression_opts=6)
+                f.create_dataset("timestamps", data=ts_arr,  **kw)
+                f.create_dataset("angles",     data=ang_arr, **kw)
+                f.create_dataset("confidence", data=cf_arr,  **kw)
+                f.create_dataset("landmarks",  data=lm_arr,  **kw)
 
         elif fmt == "npz":
             np.savez_compressed(
                 path,
                 timestamps  = ts_arr,
-                angles      = angles_arr,
-                confidence  = conf_arr,
+                angles      = ang_arr,
+                confidence  = cf_arr,
                 landmarks   = lm_arr,
                 joint_names = np.array(JOINT_NAMES),
+                label       = np.array(label),
             )
 
         elif fmt == "csv":
             import csv
-            with open(path, "w", newline="") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(["timestamp", "confidence"] + JOINT_NAMES)
-                for t, c, a in zip(ts_arr, conf_arr, angles_arr):
-                    writer.writerow([f"{t:.4f}", f"{c:.3f}"] + a.tolist())
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp", "confidence"] + JOINT_NAMES)
+                for t, c, a in zip(ts_arr, cf_arr, ang_arr):
+                    w.writerow([f"{t:.6f}", f"{c:.4f}"] + a.tolist())
 
         else:
-            raise ValueError(f"Unknown format: {fmt!r}. Use h5 / npz / csv.")
+            raise ValueError(f"Unknown format {fmt!r}. Use h5 / npz / csv.")
 
-        print(f"[Recorder] Saved {self.n_frames} frames → {path}")
+        print(f"[Recorder] Saved {N} frames → {path}"
+              + (f"  (label='{label}')" if label else ""))
         return path

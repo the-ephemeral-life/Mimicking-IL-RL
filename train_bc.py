@@ -6,21 +6,17 @@ import numpy as np
 import h5py  # <--- Add this line!
 
 # --- 1. DEFINE THE NEURAL NETWORK ---
+# --- 1. DEFINE THE NEURAL NETWORK ---
 class BehavioralCloningMLP(nn.Module):
-    def __init__(self, input_dim=99, output_dim=29):
+    # CHANGED: output_dim is now exactly 8!
+    def __init__(self, input_dim=99, output_dim=8): 
         super(BehavioralCloningMLP, self).__init__()
-        
-        # A simple, fast feed-forward network
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, output_dim) # Linear output for continuous joint angles (radians)
+            nn.Linear(input_dim, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, output_dim) 
         )
-
     def forward(self, x):
         return self.net(x)
 
@@ -29,31 +25,26 @@ class G1ImitationDataset(Dataset):
     def __init__(self, filepath):
         print(f"Loading dataset from {filepath}...")
         
-        # Handle HDF5 files (.h5)
         if str(filepath).endswith('.h5') or str(filepath).endswith('.hdf5'):
             with h5py.File(filepath, 'r') as f:
                 raw_landmarks = f["landmarks"][:]
-                self.Y = f["angles"][:].astype(np.float32)
-                
-        # Handle NumPy compressed files (.npz)
-        elif str(filepath).endswith('.npz'):
-            data = np.load(filepath, allow_pickle=True)
-            raw_landmarks = data["landmarks"]
-            self.Y = data["angles"].astype(np.float32)
-            
+                all_angles = f["angles"][:].astype(np.float32)
         else:
-            raise ValueError("Unsupported file format! Please use .h5 or .npz")
+            raise ValueError("Use .h5 files!")
 
-        # Extract features: Landmarks shape (N, 33, 3) -> Flatten to (N, 99)
         self.X = raw_landmarks.reshape(raw_landmarks.shape[0], -1).astype(np.float32)
         
-        print(f"Loaded {self.X.shape[0]} frames.")
+        # THE MAGIC SLICE: Extract only the 4 Left Arm joints and 4 Right Arm joints
+        left_arm_angles = all_angles[:, 15:19]
+        right_arm_angles = all_angles[:, 22:26]
+        
+        # Combine them into an 8-column array
+        self.Y = np.concatenate([left_arm_angles, right_arm_angles], axis=1)
+        
+        print(f"Loaded {self.X.shape[0]} frames. Output targets: {self.Y.shape[1]} (Arms Only!)")
 
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.Y[idx]
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.Y[idx]
 # --- 3. TRAINING LOOP ---
 def train_model(dataset_path="dataset.npz", epochs=50, batch_size=64, lr=0.001):
     # Setup Data
