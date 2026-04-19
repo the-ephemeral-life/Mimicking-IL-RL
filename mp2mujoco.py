@@ -345,33 +345,6 @@ def _shoulder_angles(lms, side: str):
 
 # ── 7f. Elbow ─────────────────────────────────────────────────────────────────
 def _elbow_angle(lms, side: str) -> float:
-    """
-    ROOT FIX — Elbow flexion measured in the arm's own sagittal plane.
-
-    WHY THE OLD CODE FAILED
-    ────────────────────────
-    _angle_between(upper_arm, forearm) is a world-space angle. When MediaPipe's
-    depth estimation tilts the upper arm forward (common in monocular video),
-    it reports ~88° even for a straight arm, because a vertical forearm and a
-    forward-tilted upper arm are nearly perpendicular in world space.
-
-    ELBOW_REST_BIAS=1.8 / SENSITIVITY=2.2 were masking this by:
-      1. Creating a 47° dead zone — so relaxation was invisible to the robot
-      2. Biasing training labels — model learned that "neutral" = 90° bent
-
-    THE FIX: atan2 decomposition in the arm's sagittal plane
-    ──────────────────────────────────────────────────────────
-    Build a local frame for the upper arm:
-      e_ext  = upper_arm direction       (forearm collinear = 0° flex)
-      e_flex = ⊥ to upper_arm in the    (forearm moving here = positive flex)
-               arm's sagittal plane
-
-    This measures how much the forearm ACTUALLY deviates from the upper arm's
-    extension — independent of where the upper arm is pointing.
-
-    Result: 0° when arm is anatomically straight (regardless of shoulder pitch
-    or MediaPipe depth error), positive only for genuine elbow flexion.
-    """
     s_idx = MP.LEFT_SHOULDER if side == "left" else MP.RIGHT_SHOULDER
     e_idx = MP.LEFT_ELBOW    if side == "left" else MP.RIGHT_ELBOW
     w_idx = MP.LEFT_WRIST    if side == "left" else MP.RIGHT_WRIST
@@ -380,46 +353,37 @@ def _elbow_angle(lms, side: str) -> float:
     elbow    = _p(lms, e_idx)
     wrist    = _p(lms, w_idx)
 
-    upper_arm = _unit(elbow - shoulder)   # shoulder → elbow
-    forearm   = _unit(wrist  - elbow)     # elbow → wrist
+    upper_arm = _unit(elbow - shoulder)
+    forearm   = _unit(wrist  - elbow)
 
-    # ── Build arm sagittal plane ──────────────────────────────────────────
-    # Use the body's right axis, projected ⊥ to upper_arm, as the plane normal.
-    # This rotates the sagittal plane with the shoulder (handles abduction, etc.)
+    # ---- BODY RIGHT AXIS ----
     ls = _p(lms, MP.LEFT_SHOULDER)
     rs = _p(lms, MP.RIGHT_SHOULDER)
-    body_right = _unit(rs - ls)   # global body right-ward axis
+    body_right = _unit(rs - ls)
 
-    # Remove component parallel to upper_arm → gives arm-plane normal
+    # ---- BUILD ARM SAGITTAL PLANE ----
     br_perp = body_right - np.dot(body_right, upper_arm) * upper_arm
-    br_perp_mag = np.linalg.norm(br_perp)
-    if br_perp_mag < 1e-6:
-        # Degenerate: arm is pointing directly sideways; fall back to world_up
+
+    if np.linalg.norm(br_perp) < 1e-6:
         world_up = np.array([0., 0., 1.])
         br_perp = world_up - np.dot(world_up, upper_arm) * upper_arm
-        br_perp_mag = np.linalg.norm(br_perp) + 1e-9
-    plane_normal = br_perp / br_perp_mag
 
-    # Flexion direction: ⊥ to upper_arm, in the sagittal plane
-    # (points "forward" for a hanging arm — the direction the forearm moves when flexing)
-    e_flex = _unit(np.cross(plane_normal, upper_arm) + 1e-9)
+    plane_normal = _unit(br_perp)
 
-    # ── Decompose forearm into arm-frame components ───────────────────────
-    ext_component  = np.dot(forearm, upper_arm)  # 1.0 = fully extended
-    flex_component = np.dot(forearm, e_flex)      # > 0 = genuinely flexed
+    # ---- FLEXION DIRECTION ----
+    e_flex = _unit(np.cross(plane_normal, upper_arm))
 
-    # Continuous signed angle: 0 = straight, positive = flexed
-    flex_angle = float(np.arctan2(flex_component, ext_component))
+    # ---- DECOMPOSE ----
+    ext = np.dot(forearm, upper_arm)
+    flex = np.dot(forearm, e_flex)
 
-    # ── Small anatomically-motivated dead zone (~10°) ─────────────────────
-    # Absorbs the natural ~8–10° carrying angle (cubitus valgus) and
-    # residual MediaPipe landmark jitter at full extension.
-    # This is NOT a large compensatory hack — it's a noise floor.
+    angle = float(np.arctan2(flex, ext))
+
+    # ---- SMALL DEAD ZONE ----
     DEAD_ZONE = np.deg2rad(10)
-    flex_angle = max(0.0, flex_angle - DEAD_ZONE)
+    angle = max(0.0, angle - DEAD_ZONE)
 
-    # G1 convention: elbow flexion is negative
-    return float(np.clip(-flex_angle, -2.09, 0.0))
+    return float(np.clip(-angle, -2.09, 0.0))
 
 # ── 7g. Wrist Roll  (NEW – G1 specific) ──────────────────────────────────────
 
