@@ -304,65 +304,71 @@ def _ankle_angles(lms, side: str):
 
 # ── 7e. Shoulder ──────────────────────────────────────────────────────────────
 
+# ── 7e. Shoulder ──────────────────────────────────────────────────────────────
+
 def _shoulder_angles(lms, side: str):
     """
     Returns (pitch, roll, yaw) in G1 shoulder convention.
-    pitch – flexion/extension
-    roll  – abduction/adduction
-    yaw   – internal/external rotation
+    Yaw is permanently locked to 0.0.
     """
-    s_idx  = MP.LEFT_SHOULDER  if side == "left" else MP.RIGHT_SHOULDER
-    e_idx  = MP.LEFT_ELBOW     if side == "left" else MP.RIGHT_ELBOW
-    o_idx  = MP.RIGHT_SHOULDER if side == "left" else MP.LEFT_SHOULDER
+    # --- TUNING PARAMETERS ---
+    # Increase ROLL_SENSITIVITY (e.g., 1.5) to make the robot move more than you.
+    # Adjust REST_OFFSET to push the arms further out from the ribs at rest.
+    ROLL_SENSITIVITY = 1.5  
+    REST_OFFSET      = -0.20 
+
+    s_idx = MP.LEFT_SHOULDER if side == "left" else MP.RIGHT_SHOULDER
+    e_idx = MP.LEFT_ELBOW    if side == "left" else MP.RIGHT_ELBOW
 
     shoulder = _p(lms, s_idx)
     elbow    = _p(lms, e_idx)
-    opp_sh   = _p(lms, o_idx)
+    
+    ls = _p(lms, MP.LEFT_SHOULDER)
+    rs = _p(lms, MP.RIGHT_SHOULDER)
 
-    # --- 1. DEFINE AXES ---
-    trunk_right = _unit(opp_sh - shoulder) * (-1 if side == "left" else 1)
-    trunk_left  = -trunk_right  # Explicitly defined to fix the crash!
-    world_up    = np.array([0., 0., 1.])
-    trunk_fwd   = _unit(np.cross(trunk_right, world_up))
+    # Use the existing body_left definition from your script
+    body_left = _unit(ls - rs)
+    world_up  = np.array([0., 0., 1.])
+    body_fwd  = _unit(np.cross(body_left, world_up))
 
     upper_arm = _unit(elbow - shoulder)
 
-    # --- 2. PITCH (Sagittal plane) ---
-    # Negative sign restores the UI "-1 moves forward" polarity
-    v_fwd = np.dot(upper_arm, trunk_fwd)
-    pitch = -float(np.arcsin(np.clip(v_fwd, -1.0, 1.0)))
+    # PITCH (Sagittal plane)
+    v_fwd = np.dot(upper_arm, body_fwd)
+    pitch = float(np.arcsin(np.clip(v_fwd, -1.0, 1.0)))
 
-    # --- 3. ROLL (Coronal plane) ---
-    # Using arcsin isolates Roll from Gravity, completely fixing the "Zombie Pose"
-    v_lat = np.dot(upper_arm, trunk_left)
-    roll = float(np.arcsin(np.clip(v_lat, -1.0, 1.0)))
-
-    # --- 4. YAW (Horizontal plane) ---
-    ua_h  = np.array([upper_arm[0], upper_arm[1], 0.])
-    horiz_mag = np.linalg.norm(ua_h)
+    # ROLL (Coronal plane)
+    # FIXED: Using body_left instead of the undefined trunk_left
+    v_lat = np.dot(upper_arm, body_left)
     
-    # The 0.30 deadzone prevents violent Yaw swinging when arms are resting
-    if horiz_mag > 0.30:
-        ref_h = _unit(np.array([trunk_fwd[0], trunk_fwd[1], 0.]) + 1e-9)
-        ua_h_unit = ua_h / horiz_mag
-        yaw = _signed_angle(ref_h, ua_h_unit, world_up)
-    else:
-        yaw = 0.0
+    # Calculate base roll and apply sensitivity and resting offset
+    roll_raw = float(np.arcsin(np.clip(v_lat, -1.0, 1.0)))
+    roll = (roll_raw * ROLL_SENSITIVITY) + REST_OFFSET
+
+    # YAW (Locked)
+    yaw = 0.0
 
     return pitch, roll, yaw
 
+
 # ── 7f. Elbow ─────────────────────────────────────────────────────────────────
-
 def _elbow_angle(lms, side: str) -> float:
-    """Elbow flexion via shoulder-elbow-wrist angle. Always ≥ 0."""
-    s = MP.LEFT_SHOULDER if side == "left" else MP.RIGHT_SHOULDER
-    e = MP.LEFT_ELBOW    if side == "left" else MP.RIGHT_ELBOW
-    w = MP.LEFT_WRIST    if side == "left" else MP.RIGHT_WRIST
+    """
+    Straight arm = 0.0. 
+    Subtracts a small bias so the robot stays straight at human rest.
+    """
+    s = _p(lms, MP.LEFT_SHOULDER if side == "left" else MP.RIGHT_SHOULDER)
+    e = _p(lms, MP.LEFT_ELBOW    if side == "left" else MP.RIGHT_ELBOW)
+    w = _p(lms, MP.LEFT_WRIST    if side == "left" else MP.RIGHT_WRIST)
 
-    upper = _p(lms, e) - _p(lms, s)
-    lower = _p(lms, w) - _p(lms, e)
-    return max(0.0, float(np.pi - _angle_between(upper, lower)))
+    upper = e - s 
+    lower = w - e 
+    
+    angle = float(_angle_between(upper, lower))
 
+    # Subtract 0.5 to cancel out the natural resting bend detected by the camera.
+    # This ensures the robot's arms stay "out" (straight) at rest.
+    return max(0.0, angle - 0.5)
 
 # ── 7g. Wrist Roll  (NEW – G1 specific) ──────────────────────────────────────
 

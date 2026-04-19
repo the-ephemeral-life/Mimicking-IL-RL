@@ -46,7 +46,7 @@ class G1ImitationDataset(Dataset):
     def __len__(self): return len(self.X)
     def __getitem__(self, idx): return self.X[idx], self.Y[idx]
 # --- 3. TRAINING LOOP ---
-def train_model(dataset_path="dataset.npz", epochs=100, batch_size=64, lr=0.001):
+def train_model(dataset_path="dataset.npz", epochs=50, batch_size=64, lr=0.001):
     # Setup Data
     dataset = G1ImitationDataset(dataset_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
